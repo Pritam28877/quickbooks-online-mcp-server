@@ -2,11 +2,17 @@
 // Regenerate with: node scripts/generate-vendor-tool-registry.mjs
 //
 // Every tool vendored from intuit/quickbooks-online-mcp-server, as data. This
-// file states only what exists. Risk classification and which tools are actually
-// exposed are decided in tool-allowlist.ts, so regenerating this file can never
-// silently change a tool's risk or expose something new without review.
+// file states only what exists; tool-allowlist.ts decides what that means.
 //
-// 141 tools.
+// Regenerating DOES expose new tools. ALLOWLISTED_TOOLS registers every vendored
+// tool that is neither curated nor in EXCLUDED_TOOLS, which is currently empty,
+// so a tool added here reaches clients on the next boot. Risk is not guessed
+// silently: riskForVendoredTool classifies by verb and throws on an unrecognised
+// one, so an unfamiliar tool fails startup rather than shipping unreviewed.
+// Read the diff before regenerating, and withdraw anything unwanted by name via
+// EXCLUDED_TOOLS.
+//
+// 142 tools.
 
 import type { z } from "zod";
 import type { ToolDefinition } from "../vendor/types/tool-definition.js";
@@ -79,6 +85,7 @@ import { GetInvoicePdfTool } from "../vendor/tools/get-invoice-pdf.tool.js";
 import { GetJournalEntryTool } from "../vendor/tools/get-journal-entry.tool.js";
 import { GetPaymentMethodTool } from "../vendor/tools/get-payment-method.tool.js";
 import { GetPaymentTool } from "../vendor/tools/get-payment.tool.js";
+import { GetPreferencesTool } from "../vendor/tools/get-preferences.tool.js";
 import { GetProfitAndLossTool } from "../vendor/tools/get-profit-and-loss.tool.js";
 import { GetPurchaseOrderTool } from "../vendor/tools/get-purchase-order.tool.js";
 import { GetPurchaseTool } from "../vendor/tools/get-purchase.tool.js";
@@ -231,6 +238,7 @@ export const VENDORED_TOOLS: readonly VendoredToolEntry[] = [
   { name: "get_journal_entry", definition: GetJournalEntryTool as AnyVendoredTool },
   { name: "get_payment_method", definition: GetPaymentMethodTool as AnyVendoredTool },
   { name: "get_payment", definition: GetPaymentTool as AnyVendoredTool },
+  { name: "get_preferences", definition: GetPreferencesTool as AnyVendoredTool },
   { name: "get_profit_and_loss", definition: GetProfitAndLossTool as AnyVendoredTool },
   { name: "get_purchase_order", definition: GetPurchaseOrderTool as AnyVendoredTool },
   { name: "get_purchase", definition: GetPurchaseTool as AnyVendoredTool },

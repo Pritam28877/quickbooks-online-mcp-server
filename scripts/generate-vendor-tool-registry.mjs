@@ -74,9 +74,15 @@ const output = `// GENERATED FILE — DO NOT EDIT BY HAND.
 // Regenerate with: node scripts/generate-vendor-tool-registry.mjs
 //
 // Every tool vendored from intuit/quickbooks-online-mcp-server, as data. This
-// file states only what exists. Risk classification and which tools are actually
-// exposed are decided in tool-allowlist.ts, so regenerating this file can never
-// silently change a tool's risk or expose something new without review.
+// file states only what exists; tool-allowlist.ts decides what that means.
+//
+// Regenerating DOES expose new tools. ALLOWLISTED_TOOLS registers every vendored
+// tool that is neither curated nor in EXCLUDED_TOOLS, which is currently empty,
+// so a tool added here reaches clients on the next boot. Risk is not guessed
+// silently: riskForVendoredTool classifies by verb and throws on an unrecognised
+// one, so an unfamiliar tool fails startup rather than shipping unreviewed.
+// Read the diff before regenerating, and withdraw anything unwanted by name via
+// EXCLUDED_TOOLS.
 //
 // ${discovered.length} tools.
 

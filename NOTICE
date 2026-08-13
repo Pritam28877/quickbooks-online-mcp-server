@@ -2,7 +2,7 @@ This product includes software developed by Intuit Inc.
 
   Project: quickbooks-online-mcp-server
   Source:  https://github.com/intuit/quickbooks-online-mcp-server
-  Commit:  099351858ee696dbbeb00dc7ca8e3a86276d86bb  (2026-07-14)
+  Commit:  c351dc011d9cb14b211857457085f7994d8b1e15  (2026-08-10)
   Licence: Apache License 2.0 — see src/vendor/LICENSE
 
 Note on upstream licence metadata: the upstream repository's LICENSE file is
@@ -13,8 +13,8 @@ project treats the LICENSE file as authoritative and attributes Apache-2.0.
 What is vendored, verbatim, from the commit above
 --------------------------------------------------------------------------------
 
-  src/vendor/handlers/   141 files   QuickBooks entity operations
-  src/vendor/tools/      141 files   MCP tool definitions and zod schemas
+  src/vendor/handlers/   142 files   QuickBooks entity operations
+  src/vendor/tools/      142 files   MCP tool definitions and zod schemas
   src/vendor/helpers/      3 files   search criteria, tool registration (see below)
   src/vendor/types/        5 files   ambient module declarations
   src/vendor/LICENSE                 upstream Apache-2.0 licence text
@@ -27,7 +27,7 @@ What is deliberately NOT vendored, and why
 --------------------------------------------------------------------------------
 
   src/index.ts
-      Binds StdioServerTransport and imports all 141 tools at module load.
+      Binds StdioServerTransport and imports all 142 tools at module load.
       This service speaks Streamable HTTP and exposes a curated allowlist.
 
   src/auth-server.ts
@@ -48,7 +48,7 @@ What is deliberately NOT vendored, and why
       singleton, and can start a browser OAuth flow on port 8000. The result is
       one QuickBooks company per process, which makes multi-tenancy impossible.
       A replacement occupies the same import path (src/vendor/clients/
-      quickbooks-client.ts) so the 141 vendored handlers need no edits.
+      quickbooks-client.ts) so the 142 vendored handlers need no edits.
 
 Upstream dependencies dropped: dotenv and open (no filesystem credentials, no
 browser), intuit-oauth (token acquisition and refresh belong to the calling API,
@@ -97,16 +97,17 @@ one of these names goes missing.
       a link redeemable through GET /v1/pdf/{realmId}/{handle}.
 
   delete_invoice
-      Not exposed at all, and not replaced under the same name: cancellation is
-      void_invoice. See the re-sync notes below.
+      Exposed on request and classified HIGH_RISK, so the calling API approves
+      every call. Not replaced under the same name: cancellation is void_invoice,
+      which keeps the record auditable. See the re-sync notes below.
 
 --------------------------------------------------------------------------------
 The multi-tenancy seam
 --------------------------------------------------------------------------------
 
-All 141 vendored handlers reach QuickBooks through exactly two static methods:
+All 142 vendored handlers reach QuickBooks through exactly two static methods:
 
-  QuickbooksClient.getInstance()          used by all 141
+  QuickbooksClient.getInstance()          used by all 142
   QuickbooksClient.getAuthCredentials()   used by create-quickbooks-attachable
 
 Both are re-implemented to resolve the current request's tenant (realm id and
@@ -127,12 +128,18 @@ Re-syncing with upstream
      helpers/format-error.ts — all four are deliberately replaced (see above).
   5. Run the type check. Breakage appears as changed call signatures against
      src/runtime/, which is the intended blast radius.
-  6. Re-read the diff for new tools: newly added tools are not exposed until
-     they are added to the allowlist in src/runtime/.
-  7. Re-check upstream's delete and write handlers for behaviour changes before
-     exposing anything new. As of the pinned commit, delete-quickbooks-invoice
-     attempts a genuine hard delete before falling back to a void, which is why
-     it is not on the allowlist.
+  6. Re-read the diff for new tools, because regenerating the registry exposes
+     them. ALLOWLISTED_TOOLS registers every vendored tool that is neither
+     curated nor named in EXCLUDED_TOOLS, and EXCLUDED_TOOLS is empty, so a new
+     upstream tool reaches clients on the next boot. Risk is still not guessed
+     quietly: riskForVendoredTool classifies by verb and throws on an
+     unrecognised one, so an unfamiliar tool fails startup instead of shipping
+     unreviewed. Withdraw anything unwanted by adding its name to EXCLUDED_TOOLS.
+  7. Re-check upstream's delete and write handlers for behaviour changes.
+     delete-quickbooks-invoice attempts a genuine hard delete before falling back
+     to a void; it is exposed and classified HIGH_RISK, so the calling API must
+     approve every call. void_invoice remains the correct way to cancel, because
+     it keeps the transaction auditable.
   8. Re-check the superseded tools listed above. If upstream has fixed one of
      them, the replacement can be retired — but verify the fix rather than
      assuming it, and remove the name from OVERRIDDEN_TOOLS in the same change so

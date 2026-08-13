@@ -24,5 +24,14 @@
   "devDependencies": {
     "@types/node": "^22.13.10",
     "typescript": "^5.8.2"
+  },
+  "overrides": {
+    "node-quickbooks": {
+      "fast-xml-parser": "^5.10.1",
+      "underscore": "^1.13.8",
+      "uuid": "11.1.1"
+    },
+    "fast-uri": "^3.1.5",
+    "hono": "^4.13.1"
   }
 }
