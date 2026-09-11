@@ -25,7 +25,8 @@ const { ALLOWLISTED_TOOLS, assertAllowlistIntegrity, OVERRIDDEN_TOOLS, riskOf, r
   `${dist}/tool-allowlist.js`
 );
 const { VENDORED_TOOLS } = await import(`${dist}/vendor-tool-registry.generated.js`);
-const { forgetRealm } = await import(`${dist}/cache/reference-cache.js`);
+const { buildBillPaymentEntity } = await import(`${dist}/bill-payment-draft.js`);
+const { forgetRealm, forgetKind } = await import(`${dist}/cache/reference-cache.js`);
 const { TtlCache } = await import(`${dist}/cache/ttl-cache.js`);
 const { toPage, resolvePage, MAX_PAGE_BYTES, MAX_PAGE_SIZE } = await import(`${dist}/pagination.js`);
 const { readCapabilities, companyCapabilities } = await import(`${dist}/preferences.js`);
@@ -39,7 +40,7 @@ const { signTenantBinding, verifyTenantBinding, BINDING_ERROR_CODES, BINDING_HEA
 const { verifyExecutionAssertion, EXECUTION_ASSERTION_ERROR_CODES, EXECUTION_ASSERTION_HEADER } = await import(
   `${dist}/execution-assertion.js`
 );
-const { createHttpServer } = await import(`${dist}/http-server.js`);
+const { createHttpServer, markVendorFailure } = await import(`${dist}/http-server.js`);
 const { loadConfig } = await import(`${dist}/config.js`);
 const {
   configureTransportPolicy,
@@ -312,7 +313,124 @@ check("create, update and void are WRITE", ["create_invoice", "update_invoice", 
 check("send is HIGH_RISK", riskOf("send_invoice") === "HIGH_RISK");
 check("every overridden tool is present", OVERRIDDEN_TOOLS.every((n) => tool(n) !== undefined));
 
+// Money movement is the one place the verb rule is wrong in the dangerous direction:
+// "create" alone would put a withdrawal in the same tier as a draft nobody has paid.
+check(
+  "paying a bill is the highest tier, not an ordinary write",
+  riskOf("create_bill_payment") === "HIGH_RISK",
+  `create_bill_payment=${riskOf("create_bill_payment")}`,
+);
+check(
+  "every money-movement tool is HIGH_RISK",
+  ["create_bill_payment", "update_bill_payment", "create_payment", "update_payment", "create_deposit",
+   "update_deposit", "create_transfer", "update_transfer", "create_purchase", "update_purchase",
+   "create_refund_receipt", "update_refund_receipt"].every((n) => riskOf(n) === "HIGH_RISK"),
+);
+// The other half of the same judgement: recording an obligation is not settling one.
+// Over-classifying is its own failure — it trains people to approve without reading.
+check(
+  "recording an obligation stays an ordinary write",
+  // Names are as registered: create-bill and create-vendor are two of the eight
+  // kebab-case vendored tools, and riskOf looks up the registered name verbatim.
+  ["create-bill", "create-vendor", "create_invoice", "create_journal_entry", "create_purchase_order"]
+    .every((n) => riskOf(n) === "WRITE"),
+);
+check(
+  "a payment cannot be created without a named account, date and bills",
+  (() => {
+    const schema = tool("create_bill_payment").schema;
+    const complete = { vendor_id: "7", bills: [{ bill_id: "12", amount: 125 }], payment_account_id: "35", payment_date: "2026-09-04" };
+    if (!schema.safeParse(complete).success) return false;
+    for (const missing of ["payment_account_id", "payment_date", "bills", "vendor_id"]) {
+      const partial = { ...complete };
+      delete partial[missing];
+      if (schema.safeParse(partial).success) return false;
+    }
+    // The upstream shape it replaces must no longer be accepted.
+    return !schema.safeParse({ billPayment: { TotalAmt: 125 } }).success;
+  })(),
+);
+check(
+  "a payment total is derived from its bills, never taken from the caller",
+  (() => {
+    const entity = buildBillPaymentEntity({
+      vendor_id: "7",
+      bills: [{ bill_id: "12", amount: 125.5 }, { bill_id: "13", amount: 74.5 }],
+      payment_account_id: "35",
+      payment_date: "2026-09-04",
+      pay_type: "Check",
+    });
+    return entity.TotalAmt === 200 && entity.CheckPayment.BankAccountRef.value === "35" && entity.Line.length === 2;
+  })(),
+);
+check(
+  "a credit card payment names a card account, not a bank account",
+  (() => {
+    const entity = buildBillPaymentEntity({
+      vendor_id: "7",
+      bills: [{ bill_id: "12", amount: 10 }],
+      payment_account_id: "42",
+      payment_date: "2026-09-04",
+      pay_type: "CreditCard",
+    });
+    return entity.CreditCardPayment.CCAccountRef.value === "42" && entity.CheckPayment === undefined;
+  })(),
+);
+
 // ---------------------------------------------------------------- bounded paging
+section("payables reads are curated, bounded and cached (NF-04)");
+for (const name of ["search_vendors", "search_accounts", "search_classes", "search_bills"]) {
+  check(`${name} is this service's own, not the vendored one`, OVERRIDDEN_TOOLS.includes(name) && tool(name) !== undefined);
+  // The two defects the factory exists to close, on the four reads a bill run makes most.
+  check(
+    `${name} rejects an unknown filter field before any query is built`,
+    tool(name).schema.safeParse({ filters: [{ field: "NotAField", value: "x" }] }).success === false,
+  );
+  check(
+    `${name} has no way to ask for everything`,
+    tool(name).schema.safeParse({ fetchAll: true }).success === false ||
+      tool(name).schema.parse({ fetchAll: true }).fetchAll === undefined,
+  );
+}
+check(
+  "a bill search can filter by vendor, which is what coding from history needs",
+  tool("search_bills").schema.safeParse({ filters: [{ field: "VendorRef", value: "7" }], limit: 20 }).success,
+);
+check(
+  "an account search can filter by type, which is what tells two 'Supplies' apart",
+  tool("search_accounts").schema.safeParse({ filters: [{ field: "AccountType", value: "Expense" }] }).success,
+);
+
+// Reads are the metered half and coding a month of invoices consults these constantly.
+seen.length = 0;
+await call(REALM_MULTI, "search_classes", { limit: 5 });
+const classCallsFirst = seen.length;
+await call(REALM_MULTI, "search_classes", { limit: 5 });
+check("a repeated class list is served from the cache", seen.length === classCallsFirst, `${seen.length} vs ${classCallsFirst}`);
+
+seen.length = 0;
+await call(REALM_MULTI, "search_bills", { limit: 5 });
+const billCallsFirst = seen.length;
+await call(REALM_MULTI, "search_bills", { limit: 5 });
+check(
+  "bills are never cached, because a stale one would be read as history",
+  seen.length > billCallsFirst,
+  `${seen.length} vs ${billCallsFirst}`,
+);
+
+// A TTL cannot cover the case where this service made the change itself.
+seen.length = 0;
+await call(REALM_MULTI, "search_vendors", { limit: 5 });
+const vendorCallsFirst = seen.length;
+await call(REALM_MULTI, "search_vendors", { limit: 5 });
+check("a repeated vendor list is served from the cache", seen.length === vendorCallsFirst);
+forgetKind(REALM_MULTI, "vendor");
+await call(REALM_MULTI, "search_vendors", { limit: 5 });
+check(
+  "creating a vendor drops the cached list, so the lookup that follows sees it",
+  seen.length > vendorCallsFirst,
+);
+
 section("bounded paging (P4.1)");
 seen.length = 0;
 await call(REALM_MULTI, "search_invoices", { limit: 5 });
@@ -768,6 +886,40 @@ check("a write links to the invoice in the right QuickBooks environment",
     && writePayload.view_url.startsWith("https://sandbox.qbo.intuit.com/app/invoice?txnId=")
     && writePayload.view_url.endsWith(String(writePayload.id)),
   String(writePayload.view_url));
+
+// A refusal from Intuit has to arrive as a refusal. Not one of the 142 vendored tools
+// sets isError on its result: each one catches the failure and returns the message as an
+// ordinary text block, which over MCP is indistinguishable from success. The calling API
+// checked isError correctly and still reported a rejected bill as one QuickBooks had
+// "accepted... but returned no id", sending somebody to look for an entry that was never
+// created.
+section("a rejected write is reported as an error (P6.2)");
+failWith = 400;
+failCount = 1;
+const refused = await rpc({
+  binding: sign(),
+  method: "tools/call",
+  params: {
+    name: "create-bill",
+    arguments: { bill: { VendorRef: { value: "63" }, Line: [{ Amount: 10, DetailType: "AccountBasedExpenseLineDetail", AccountBasedExpenseLineDetail: { AccountRef: { value: "33" } } }] } },
+  },
+});
+failWith = null;
+failCount = 0;
+check("a bill QuickBooks rejected comes back flagged as an error",
+  refused.body.result?.isError === true,
+  JSON.stringify(refused.body.result).slice(0, 200));
+check("and carries what QuickBooks said, so the reason is not lost",
+  /Error creating bill/i.test(refused.body.result?.content?.[0]?.text ?? ""),
+  String(refused.body.result?.content?.[0]?.text).slice(0, 160));
+
+// The narrow match matters as much as the flag: a successful write must not be turned
+// into an error because its payload happens to start with a word.
+check("a successful write is left alone", markVendorFailure({ content: [{ type: "text", text: '{"id":"7"}' }] }).isError === undefined);
+check("a multi-block result is left alone",
+  markVendorFailure({ content: [{ type: "text", text: "Error creating bill: x" }, { type: "text", text: "{}" }] }).isError === undefined);
+check("a result that already flagged itself is left alone",
+  markVendorFailure({ isError: false, content: [{ type: "text", text: "Error creating bill: x" }] }).isError === false);
 
 section("graceful shutdown (P7.1)");
 // A genuine drain: the request must already be at the provider before close() is

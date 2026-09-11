@@ -22,6 +22,10 @@ interface QueryMethods {
   findItems(criteria: unknown, callback: Callback): void;
   findTerms(criteria: unknown, callback: Callback): void;
   findTaxCodes(criteria: unknown, callback: Callback): void;
+  findVendors(criteria: unknown, callback: Callback): void;
+  findAccounts(criteria: unknown, callback: Callback): void;
+  findClasses(criteria: unknown, callback: Callback): void;
+  findBills(criteria: unknown, callback: Callback): void;
   getCustomer(id: string, callback: Callback): void;
   getItem(id: string, callback: Callback): void;
   getCompanyInfo(id: string, callback: Callback): void;
@@ -89,6 +93,30 @@ export async function findTaxCodeRows(criteria: unknown): Promise<QboRow[]> {
   const methods = await queryMethods();
   const response = await promisify<unknown>((callback) => methods.findTaxCodes(criteria, callback));
   return rows(response, "TaxCode");
+}
+
+export async function findVendorRows(criteria: unknown): Promise<QboRow[]> {
+  const methods = await queryMethods();
+  const response = await promisify<unknown>((callback) => methods.findVendors(criteria, callback));
+  return rows(response, "Vendor");
+}
+
+export async function findAccountRows(criteria: unknown): Promise<QboRow[]> {
+  const methods = await queryMethods();
+  const response = await promisify<unknown>((callback) => methods.findAccounts(criteria, callback));
+  return rows(response, "Account");
+}
+
+export async function findClassRows(criteria: unknown): Promise<QboRow[]> {
+  const methods = await queryMethods();
+  const response = await promisify<unknown>((callback) => methods.findClasses(criteria, callback));
+  return rows(response, "Class");
+}
+
+export async function findBillRows(criteria: unknown): Promise<QboRow[]> {
+  const methods = await queryMethods();
+  const response = await promisify<unknown>((callback) => methods.findBills(criteria, callback));
+  return rows(response, "Bill");
 }
 
 export async function getCustomerById(id: string): Promise<QboRow> {

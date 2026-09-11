@@ -12,15 +12,20 @@ import { VoidInvoiceTool } from "./tools/void-invoice.tool.js";
 
 // Ours, replacing upstream's under the same names: bounded paging, enforced field
 // lists, per-realm caching, and a PDF link instead of inline base64.
+import { CreateBillPaymentTool } from "./tools/create-bill-payment.tool.js";
 import { CreateInvoiceTool } from "./tools/create-invoice.tool.js";
 import { GetInvoicePdfTool } from "./tools/get-invoice-pdf.tool.js";
 import { GetCompanyInfoTool, GetCustomerTool, ReadItemTool } from "./tools/reference-tools.js";
 import {
+  SearchAccountsTool,
+  SearchBillsTool,
+  SearchClassesTool,
   SearchCustomersTool,
   SearchInvoicesTool,
   SearchItemsTool,
   SearchTaxCodesTool,
   SearchTermsTool,
+  SearchVendorsTool,
 } from "./tools/search-tools.js";
 
 import { VENDORED_TOOLS } from "./vendor-tool-registry.generated.js";
@@ -92,6 +97,12 @@ export const EXCLUDED_TOOLS = [] as const;
  * read_item        same
  * get_company_info same, and upstream lets the caller name a company
  * get_invoice_pdf  upstream returns inline base64 or writes to the filesystem
+ * search_vendors, search_accounts, search_classes, search_bills
+ *                  the same two defects as the other searches, on the four reads a
+ *                  bill run makes most: fetchAll on bills is a whole company's
+ *                  transaction history in one metered call
+ * create_bill_payment  upstream takes `billPayment: z.any()` with no idempotency,
+ *                  for the one call that withdraws money from a bank account
  */
 export const OVERRIDDEN_TOOLS = [
   "create_invoice",
@@ -105,6 +116,11 @@ export const OVERRIDDEN_TOOLS = [
   "read_item",
   "get_company_info",
   "get_invoice_pdf",
+  "create_bill_payment",
+  "search_vendors",
+  "search_accounts",
+  "search_classes",
+  "search_bills",
 ] as const;
 
 /**
@@ -137,6 +153,19 @@ const CURATED_TOOLS: readonly AllowlistedTool[] = [
   { definition: SearchTermsTool, risk: TOOL_RISK.READ_ONLY },
   { definition: SearchTaxCodesTool, risk: TOOL_RISK.READ_ONLY },
 
+  // Payables reads: what a bill has to be coded against, and how this vendor was
+  // coded before. Vendors, accounts and classes are cached per realm because coding a
+  // month of invoices reads all three constantly and they change rarely.
+  { definition: SearchVendorsTool, risk: TOOL_RISK.READ_ONLY },
+  { definition: SearchAccountsTool, risk: TOOL_RISK.READ_ONLY },
+  { definition: SearchClassesTool, risk: TOOL_RISK.READ_ONLY },
+  { definition: SearchBillsTool, risk: TOOL_RISK.READ_ONLY },
+
+  // Payables. Drafting a bill is ordinary bookkeeping; paying one is not, so only the
+  // payment carries the top tier. Ours: named bills, named account, named date, and
+  // idempotent per intent, because a retried payment is a second withdrawal.
+  { definition: CreateBillPaymentTool, risk: TOOL_RISK.HIGH_RISK },
+
   // Context and receivables questions.
   { definition: GetCompanyInfoTool, risk: TOOL_RISK.READ_ONLY },
   { definition: GetAgedReceivablesTool as AnyToolDefinition, risk: TOOL_RISK.READ_ONLY },
@@ -144,7 +173,52 @@ const CURATED_TOOLS: readonly AllowlistedTool[] = [
 ];
 
 /**
+ * Tools that settle or move money, named one by one.
+ *
+ * The verb rule below cannot see this: `create_bill_payment` splits to "create" and
+ * lands on WRITE, the same tier as drafting a bill that nobody has paid yet. Drafting
+ * a bill is reversible bookkeeping; releasing funds from a client's bank account is
+ * not, and for the accounting firms using this service those are client funds, often
+ * restricted grant money. So money movement is classified by review, by name.
+ *
+ * Each entry is here because it settles or transfers funds, not merely because it
+ * writes:
+ *
+ * - `bill_payment`      pays a vendor bill — money leaves the client's bank account
+ * - `payment`           settles a customer invoice against a deposit account
+ * - `deposit`           moves funds into a bank account
+ * - `transfer`          moves funds between two bank accounts
+ * - `purchase`          a check, card or cash spend — money out at the moment it posts
+ * - `refund_receipt`    returns money to a customer
+ *
+ * The `update_` twins are included for the same reason as the `create_` ones: editing
+ * a payment's amount, account or date moves different money than was approved.
+ *
+ * Deliberately absent: `create-bill`, `create_invoice`, `create_journal_entry` and the
+ * rest of the ordinary bookkeeping surface. They record obligations; they do not settle
+ * them. Over-classifying would make every routine entry demand a human, which is the
+ * failure mode that trains people to approve without reading.
+ */
+const MONEY_MOVEMENT_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "create_bill_payment",
+  "update_bill_payment",
+  "create_payment",
+  "update_payment",
+  "create_deposit",
+  "update_deposit",
+  "create_transfer",
+  "update_transfer",
+  "create_purchase",
+  "update_purchase",
+  "create_refund_receipt",
+  "update_refund_receipt",
+]);
+
+/**
  * Risk for a vendored tool, from its verb.
+ *
+ * Money movement is checked by name first — see MONEY_MOVEMENT_TOOL_NAMES for why the
+ * verb alone gets that wrong.
  *
  * Two details that matter more than they look:
  *
@@ -158,7 +232,10 @@ const CURATED_TOOLS: readonly AllowlistedTool[] = [
  *    direction: it demands review of one line.
  */
 export function riskForVendoredTool(toolName: string): ToolRisk {
-  const verb = toolName.replace(/-/g, "_").split("_")[0];
+  const normalizedName = toolName.replace(/-/g, "_");
+  if (MONEY_MOVEMENT_TOOL_NAMES.has(normalizedName)) return TOOL_RISK.HIGH_RISK;
+
+  const verb = normalizedName.split("_")[0];
 
   switch (verb) {
     case "get":

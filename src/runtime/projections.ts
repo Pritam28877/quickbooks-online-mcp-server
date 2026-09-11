@@ -137,3 +137,65 @@ export const projectCompanyInfo = projector({
   region: "CompanyAddr.CountrySubDivisionCode",
   postal_code: "CompanyAddr.PostalCode",
 });
+
+/**
+ * A supplier, as a bill run needs it: enough to match the name on an invoice and
+ * to tell two similarly-named vendors apart.
+ */
+export const projectVendor = projector({
+  id: "Id",
+  display_name: "DisplayName",
+  company_name: "CompanyName",
+  active: "Active",
+  balance: "Balance",
+  email: "PrimaryEmailAddr.Address",
+  city: "BillAddr.City",
+  state: "BillAddr.CountrySubDivisionCode",
+});
+
+/**
+ * An expense category from the chart of accounts.
+ *
+ * Type and subtype are included because "Supplies" appears more than once in a
+ * real chart of accounts, and the type is what tells a reviewer which one to pick.
+ */
+export const projectAccount = projector({
+  id: "Id",
+  name: "Name",
+  fully_qualified_name: "FullyQualifiedName",
+  account_type: "AccountType",
+  account_sub_type: "AccountSubType",
+  classification: "Classification",
+  active: "Active",
+});
+
+/** A class — for these customers, the restricted fund an expense is charged to. */
+export const projectClass = projector({
+  id: "Id",
+  name: "Name",
+  fully_qualified_name: "FullyQualifiedName",
+  active: "Active",
+});
+
+/**
+ * A bill, summarised for coding from history.
+ *
+ * `lines` is kept in full rather than projected away, because the whole point of
+ * reading a vendor's past bills is the account and class on each line — the one
+ * place a summary would throw away exactly what is needed.
+ */
+export function projectBill(row: QboRow): QboRow {
+  const summary = projector({
+    id: "Id",
+    doc_number: "DocNumber",
+    txn_date: "TxnDate",
+    due_date: "DueDate",
+    total: "TotalAmt",
+    balance: "Balance",
+    vendor_id: "VendorRef.value",
+    vendor_name: "VendorRef.name",
+  })(row);
+  const lines = Array.isArray(row.Line) ? row.Line : [];
+  summary.Line = lines;
+  return summary;
+}

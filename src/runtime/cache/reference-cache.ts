@@ -30,11 +30,11 @@ import { TtlCache } from "./ttl-cache.js";
  *   customer balance  changes whenever a payment lands
  *   aged receivables  a financial report, expected to be current
  *
- * Invalidation: none needed beyond expiry. This service exposes no tool that
- * writes a customer, item, term or tax code, so an entry can only go stale
- * because someone changed it inside QuickBooks — which the TTL covers. If a
- * write tool for any of these entities is ever added, it must delete the
- * matching prefix here.
+ * Invalidation: expiry, plus one explicit case. This service exposes no tool that
+ * writes a customer, item, term or tax code, so those can only go stale because
+ * somebody changed them inside QuickBooks — which the TTL covers. Vendors are the
+ * exception: create-vendor is exposed, and a bill run that creates a supplier and
+ * then looks it up would miss its own write. That path calls forgetKind.
  */
 
 /**
@@ -52,6 +52,23 @@ export const REFERENCE_TTL_MS = {
   taxCode: 900_000,
   /** Company name, country and currency: static for the session's purposes. */
   companyInfo: 900_000,
+  /**
+   * Suppliers. Shorter than the configuration kinds because this service *can*
+   * create one — see forgetKind, which the create-vendor path calls so a vendor
+   * added mid-run is never invisible to the lookup that follows it.
+   */
+  vendor: 60_000,
+  /**
+   * The chart of accounts. Adding an expense category is a deliberate act in
+   * QuickBooks settings, and coding a month of invoices reads this list once per
+   * run, so a long TTL removes almost all of the metered reads that coding costs.
+   */
+  account: 900_000,
+  /**
+   * Classes, which for these customers are restricted funds. Same reasoning as
+   * accounts: predefined per company, changed deliberately, read constantly.
+   */
+  class: 900_000,
   /**
    * Multicurrency, sales-tax mode and custom transaction numbers. Changing any of
    * these is a deliberate act inside QuickBooks settings, not something that
@@ -76,6 +93,9 @@ const MAX_ENTRIES: Record<ReferenceKind, number> = {
   taxCode: 100,
   companyInfo: 100,
   preferences: 100,
+  vendor: 400,
+  account: 200,
+  class: 200,
 };
 
 const caches: Record<ReferenceKind, TtlCache<unknown>> = {
@@ -91,6 +111,9 @@ const caches: Record<ReferenceKind, TtlCache<unknown>> = {
     maxEntries: MAX_ENTRIES.preferences,
     ttlMs: REFERENCE_TTL_MS.preferences,
   }),
+  vendor: new TtlCache<unknown>({ maxEntries: MAX_ENTRIES.vendor, ttlMs: REFERENCE_TTL_MS.vendor }),
+  account: new TtlCache<unknown>({ maxEntries: MAX_ENTRIES.account, ttlMs: REFERENCE_TTL_MS.account }),
+  class: new TtlCache<unknown>({ maxEntries: MAX_ENTRIES.class, ttlMs: REFERENCE_TTL_MS.class }),
 };
 
 /**
@@ -160,6 +183,15 @@ export function forgetRealm(realmId: string): number {
   return removed;
 }
 
+/**
+ * Drops one kind for one company, for the case a TTL cannot cover: this service
+ * wrote the entity itself, so the cached list is known-stale the moment the write
+ * returns rather than at some point within the next minute.
+ */
+export function forgetKind(realmId: string, kind: ReferenceKind): number {
+  return caches[kind].deleteByPrefix(`${realmId}:`);
+}
+
 /** Cache counters for the health endpoint. Contains no tenant data. */
 export function referenceCacheStats(): Record<ReferenceKind, ReturnType<TtlCache<unknown>["stats"]>> {
   return {
@@ -169,5 +201,8 @@ export function referenceCacheStats(): Record<ReferenceKind, ReturnType<TtlCache
     taxCode: caches.taxCode.stats(),
     companyInfo: caches.companyInfo.stats(),
     preferences: caches.preferences.stats(),
+    vendor: caches.vendor.stats(),
+    account: caches.account.stats(),
+    class: caches.class.stats(),
   };
 }

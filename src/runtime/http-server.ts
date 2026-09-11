@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { referenceCacheStats } from "./cache/reference-cache.js";
+import { forgetKind, referenceCacheStats, type ReferenceKind } from "./cache/reference-cache.js";
 import type { ServiceConfig } from "./config.js";
 import {
   bearerToken,
@@ -249,6 +249,27 @@ async function handleMcpRequest(input: {
  * node-quickbooks issues its HTTP calls with no timeout of its own, so without
  * this a stalled QuickBooks socket would hold the request open indefinitely.
  */
+/**
+ * Cached reference data a tool invalidates by writing it.
+ *
+ * A TTL covers the ordinary case — somebody changed a record inside QuickBooks — but
+ * not this one: the service made the change itself, so the cached list is known-stale
+ * the instant the call returns rather than at some point within the next minute. A
+ * bill run that creates a supplier and then looks it up would otherwise miss its own
+ * write, and enter the bill against no vendor at all.
+ *
+ * Names are normalised before lookup because eight vendored tools are kebab-case.
+ */
+const CACHE_INVALIDATED_BY: Readonly<Record<string, ReferenceKind>> = {
+  create_vendor: "vendor",
+  update_vendor: "vendor",
+  delete_vendor: "vendor",
+  create_account: "account",
+  update_account: "account",
+  create_class: "class",
+  update_class: "class",
+};
+
 function registerAllowlistedTools(server: McpServer, timeoutMs: number): void {
   for (const { definition, risk } of ALLOWLISTED_TOOLS) {
     // The vendored handlers are typed against their own schemas; the registration
@@ -275,12 +296,48 @@ function registerAllowlistedTools(server: McpServer, timeoutMs: number): void {
           definition.name,
         );
         const readsAfter = tenant === null ? 0 : readsForRequest(tenant.requestId);
-        return withCallMetadata(result, {
+        const invalidated = CACHE_INVALIDATED_BY[definition.name.replace(/-/g, "_")];
+        if (invalidated !== undefined && tenant !== null) forgetKind(tenant.realmId, invalidated);
+        return withCallMetadata(markVendorFailure(result), {
           risk,
           meteredReads: readsAfter - readsBefore,
         });
       }) as typeof definition.handler,
     );
+  }
+}
+
+/**
+ * Flags a vendored handler's own error text as a protocol error.
+ *
+ * Not one of the 142 vendored tools sets `isError` on its result. Every one of them
+ * detects the failure — `if (response.isError)` — and then returns the message as an
+ * ordinary text block, which over MCP is indistinguishable from success. A caller that
+ * correctly checks `result.isError` therefore treats "Error creating bill: ..." as a bill
+ * it created, and goes looking for an id that was never in the reply.
+ *
+ * That is exactly what happened: an expense line coded to the Accounts Payable control
+ * account was rejected by Intuit, and the calling API reported "QuickBooks accepted the
+ * bill but returned no id" — an entry a person then has to go and check by hand, because
+ * the one thing it did not say is that nothing was created.
+ *
+ * Matched narrowly: one text block, starting with the vendored prefix, that is not JSON.
+ * A successful handler returns `JSON.stringify(...)`, so the two cannot be confused.
+ */
+export function markVendorFailure(result: unknown): unknown {
+  if (typeof result !== "object" || result === null) return result;
+  const shaped = result as { isError?: boolean; content?: unknown };
+  if (shaped.isError !== undefined) return result;
+  if (!Array.isArray(shaped.content) || shaped.content.length !== 1) return result;
+
+  const [block] = shaped.content as { type?: string; text?: string }[];
+  if (block?.type !== "text" || typeof block.text !== "string") return result;
+  if (!/^Error [a-z]/.test(block.text)) return result;
+  try {
+    JSON.parse(block.text);
+    return result;
+  } catch {
+    return { ...(result as Record<string, unknown>), isError: true };
   }
 }
 
