@@ -16,7 +16,13 @@ import { log } from "./logger.js";
 import { pdfHandleStats } from "./pdf-handles.js";
 import { PDF_PATH_PATTERN, servePdf } from "./pdf-route.js";
 import { forgetRequestReads, readsForRequest, transportStats } from "./qbo-transport.js";
-import { BINDING_HEADER, QboBindingError, verifyTenantBinding } from "./tenant-binding.js";
+import {
+  BINDING_ERROR_CODES,
+  BINDING_HEADER,
+  BINDING_NONCE_RETENTION_SECONDS,
+  QboBindingError,
+  verifyTenantBinding,
+} from "./tenant-binding.js";
 import { EXECUTION_ASSERTION_HEADER, QboExecutionAssertionError, verifyExecutionAssertion } from "./execution-assertion.js";
 import { ExecutionReplayStore } from "./execution-replay.js";
 import { assertTenant, QboTenantError, runInTenantScope, tenantOrNull, type QboTenant } from "./tenant-context.js";
@@ -36,6 +42,19 @@ import { configureAppLinks } from "./app-links.js";
 const MCP_PATH_PATTERN = /^\/v1\/mcp\/([^/?#]+)$/;
 const HEALTH_PATH = "/health";
 const executionReplayStore = new ExecutionReplayStore();
+/**
+ * Spent binding nonces.
+ *
+ * Held for exactly as long as a binding still verifies, so a captured header cannot
+ * be replayed by waiting for this store to forget it. See BINDING_NONCE_RETENTION_SECONDS.
+ */
+const BINDING_NONCE_CAPACITY = 50_000;
+const bindingReplayStore = new ExecutionReplayStore(
+  BINDING_NONCE_RETENTION_SECONDS * 1_000,
+  // Sized so the ceiling is never what expires a nonce: this holds six minutes of
+  // traffic at a rate far above anything Intuit's ten-concurrent-request cap permits.
+  BINDING_NONCE_CAPACITY,
+);
 
 export function createHttpServer(config: ServiceConfig): Server {
   assertAllowlistIntegrity();
@@ -192,6 +211,16 @@ function resolveTenant(request: IncomingMessage, config: ServiceConfig, pathReal
     accessToken: tenant.accessToken,
     key: config.bindingKey,
   });
+
+  // Authentic is not the same as fresh. The signature proves our API minted this header;
+  // spending the nonce is what stops the same header being sent again by anything that
+  // saw it. Scoped by realm so one company's traffic cannot burn another's nonces.
+  if (!bindingReplayStore.claim(`${verified.realmId}\u0000${verified.nonce}`)) {
+    throw new QboBindingError(
+      BINDING_ERROR_CODES.REPLAYED,
+      "this authorization has already been used; it is valid for a single request",
+    );
+  }
 
   return { ...tenant, actorUserId: verified.actorUserId, chatbotId: verified.chatbotId, connectorId: verified.connectorId };
 }

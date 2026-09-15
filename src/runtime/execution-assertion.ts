@@ -109,6 +109,15 @@ export function verifyExecutionAssertion(input: {
     throw new QboExecutionAssertionError(EXECUTION_ASSERTION_ERROR_CODES.EXPIRED, `${EXECUTION_ASSERTION_HEADER} is outside its accepted window`);
   }
   const expectedEnvironment = input.environment === "production" ? "PRODUCTION" : "SANDBOX";
+  // Attribution is not optional against real books. The actor scopes the idempotency
+  // key, so an unattributed assertion silently widens that key to the whole company
+  // and two people acting at once collide — one being handed the other's result.
+  if (expectedEnvironment === "PRODUCTION" && actorId === undefined) {
+    throw new QboExecutionAssertionError(
+      EXECUTION_ASSERTION_ERROR_CODES.MALFORMED,
+      `${EXECUTION_ASSERTION_HEADER} must name the acting user against production QuickBooks`,
+    );
+  }
   if (!equal(claimedRealm, input.realmId) || environment !== expectedEnvironment || !equal(tokenFingerprint, accessTokenFingerprint(input.accessToken))) {
     throw new QboExecutionAssertionError(EXECUTION_ASSERTION_ERROR_CODES.MISMATCH, "execution assertion does not match this QuickBooks request");
   }

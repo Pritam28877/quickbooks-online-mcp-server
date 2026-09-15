@@ -22,13 +22,27 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
  *
  * The token itself is never in the claim, only its digest — the bearer is already
  * present, and putting it in a second place doubles the chance of it being logged.
+ *
+ * A valid signature is not on its own enough, because a signed header is a bearer
+ * credential like any other: anything that observed one could resend it unchanged for
+ * as long as it verified. So every binding carries a nonce and is spendable exactly
+ * once — `verifyTenantBinding` proves the header is authentic, and the caller records
+ * the nonce as spent, which is what makes the second presentation fail.
  */
 
 /** Compact and versioned, so the format can change without guessing. */
-const BINDING_VERSION = "v1";
+const BINDING_VERSION = "v2";
 /** A binding is minted per request; minutes of tolerance is generous already. */
 const MAX_AGE_SECONDS = 300;
 const MAX_FUTURE_SKEW_SECONDS = 60;
+/**
+ * How long a spent nonce must be remembered.
+ *
+ * Exactly the window in which a binding still verifies. Remembering for any less
+ * would reopen the replay this nonce exists to close: a captured header would simply
+ * have to wait for the nonce to be forgotten while the signature was still valid.
+ */
+export const BINDING_NONCE_RETENTION_SECONDS = MAX_AGE_SECONDS + MAX_FUTURE_SKEW_SECONDS;
 /** Bounds parsing work on a hostile header. */
 const MAX_BINDING_LENGTH = 2_048;
 
@@ -41,6 +55,7 @@ export const BINDING_ERROR_CODES = {
   EXPIRED: "TENANT_BINDING_EXPIRED",
   REALM_MISMATCH: "TENANT_BINDING_REALM_MISMATCH",
   TOKEN_MISMATCH: "TENANT_BINDING_TOKEN_MISMATCH",
+  REPLAYED: "TENANT_BINDING_REPLAYED",
 } as const;
 
 export type BindingErrorCode = (typeof BINDING_ERROR_CODES)[keyof typeof BINDING_ERROR_CODES];
@@ -69,6 +84,8 @@ interface BindingClaims {
   t?: unknown;
   /** issued at, unix seconds */
   i?: unknown;
+  /** nonce: makes this binding usable exactly once */
+  n?: unknown;
 }
 
 export interface VerifiedBinding {
@@ -77,6 +94,8 @@ export interface VerifiedBinding {
   readonly chatbotId: string;
   readonly connectorId: string;
   readonly issuedAt: number;
+  /** Spend this exactly once; see `verifyTenantBinding`. */
+  readonly nonce: string;
 }
 
 /** Truncated to 32 hex characters: 128 bits, far beyond collision reach here. */
@@ -92,6 +111,8 @@ export function signTenantBinding(
     connectorId: string;
     accessToken: string;
     issuedAt: number;
+    /** Unique per minted binding. Callers that reuse one get their second request refused. */
+    nonce: string;
   },
   key: string,
 ): string {
@@ -102,6 +123,7 @@ export function signTenantBinding(
     k: claims.connectorId,
     t: accessTokenFingerprint(claims.accessToken),
     i: claims.issuedAt,
+    n: claims.nonce,
   };
   const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
   return `${BINDING_VERSION}.${encoded}.${sign(encoded, key)}`;
@@ -127,6 +149,10 @@ function requiredString(value: unknown, max: number): string | undefined {
  *
  * Order matters: the signature is checked before any claim is believed, so a
  * forged header cannot reach the comparison logic and turn it into an oracle.
+ *
+ * Authenticity only. The returned `nonce` must be spent by the caller for the
+ * single-use guarantee to hold — this function is pure so it stays testable and so
+ * the store that remembers spent nonces is the caller's to choose.
  */
 export function verifyTenantBinding(input: {
   binding: string | undefined;
@@ -168,6 +194,7 @@ export function verifyTenantBinding(input: {
   const chatbotId = requiredString(claims.c, 64);
   const connectorId = requiredString(claims.k, 64);
   const fingerprint = requiredString(claims.t, 64);
+  const nonce = requiredString(claims.n, 128);
   const issuedAt = typeof claims.i === "number" && Number.isSafeInteger(claims.i) ? claims.i : undefined;
 
   if (
@@ -176,6 +203,7 @@ export function verifyTenantBinding(input: {
     chatbotId === undefined ||
     connectorId === undefined ||
     fingerprint === undefined ||
+    nonce === undefined ||
     issuedAt === undefined
   ) {
     throw new QboBindingError(BINDING_ERROR_CODES.MALFORMED, `${BINDING_HEADER} is missing required claims`);
@@ -203,5 +231,5 @@ export function verifyTenantBinding(input: {
     );
   }
 
-  return { realmId: claimedRealm, actorUserId, chatbotId, connectorId, issuedAt };
+  return { realmId: claimedRealm, actorUserId, chatbotId, connectorId, issuedAt, nonce };
 }

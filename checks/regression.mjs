@@ -34,9 +34,10 @@ const { assertInvoiceFieldsSupported, UnsupportedForCompanyError } = await impor
 const { storePdfForDownload, takePdfForDownload, configurePdfHandleStore, pdfHandleStats, DEFAULT_PDF_LIMITS } =
   await import(`${dist}/pdf-handles.js`);
 const { configureDownloadLinks } = await import(`${dist}/download-links.js`);
-const { signTenantBinding, verifyTenantBinding, BINDING_ERROR_CODES, BINDING_HEADER } = await import(
+const { signTenantBinding, verifyTenantBinding, BINDING_ERROR_CODES, BINDING_HEADER, BINDING_NONCE_RETENTION_SECONDS } = await import(
   `${dist}/tenant-binding.js`
 );
+const { ExecutionReplayStore } = await import(`${dist}/execution-replay.js`);
 const { verifyExecutionAssertion, EXECUTION_ASSERTION_ERROR_CODES, EXECUTION_ASSERTION_HEADER } = await import(
   `${dist}/execution-assertion.js`
 );
@@ -559,6 +560,45 @@ creates.length = 0;
 await call(REALM_MULTI, "create_invoice", DRAFT, ACTOR_B);
 check("another user's identical intent is its own invoice", creates.length === 1);
 
+// A caller-supplied key used to replace the arguments outright, so two unrelated
+// payments sent under one key collapsed into one: the second never reached QuickBooks
+// and was reported as already paid. The key also becomes the provider's requestid, so
+// the collapse reached Intuit rather than stopping here.
+const { idempotencyScope, createOnce, IdempotencyKeyReuseError } = await import(`${dist}/idempotency.js`);
+const underKey = (toolArguments) =>
+  runInTenantScope(
+    { realmId: REALM_MULTI, accessToken: "intuit-token-idem-0000000000000000", actorUserId: ACTOR_A, environment: "sandbox", requestId: "r" },
+    () => idempotencyScope({ toolArguments, callerKey: "caller-key-1" }),
+  );
+const firstPayment = underKey({ bills: ["a"], amount: 100 });
+const secondPayment = underKey({ bills: ["b"], amount: 250 });
+check("a reused key still addresses one entry", firstPayment.key === secondPayment.key);
+check("but the arguments are still carried", firstPayment.argumentsFingerprint !== secondPayment.argumentsFingerprint);
+let reached = 0;
+await createOnce(firstPayment, async () => { reached += 1; return { Id: "p1" }; });
+const retry = await createOnce(underKey({ bills: ["a"], amount: 100 }), async () => { reached += 1; return { Id: "p2" }; });
+check("an identical retry under the same key replays", retry.replayed === true && reached === 1);
+let reuseRefused = null;
+try {
+  await createOnce(secondPayment, async () => { reached += 1; return { Id: "p3" }; });
+} catch (error) {
+  reuseRefused = error;
+}
+check("a different payment under the same key is refused, not collapsed", reuseRefused instanceof IdempotencyKeyReuseError);
+check("and that second payment never reached the provider", reached === 1);
+
+// The actor scopes the key. Without one it widens to the whole company, and two people
+// acting at once collide — the second handed the first's result for a write they did
+// not make. Sandbox keeps the fallback so local development works without a binding.
+const { UnattributedWriteError } = await import(`${dist}/idempotency.js`);
+const unattributed = (environment) =>
+  runInTenantScope(
+    { realmId: REALM_MULTI, accessToken: "intuit-token-idem-0000000000000000", environment, requestId: "r" },
+    () => { try { idempotencyScope({ toolArguments: { a: 1 } }); return null; } catch (error) { return error; } },
+  );
+check("an unattributed production write is refused", unattributed("production") instanceof UnattributedWriteError);
+check("and sandbox still works without a binding", unattributed("sandbox") === null);
+
 // ------------------------------------------------------------ update, void, send
 section("update, void and send (P4.3)");
 seen.length = 0;
@@ -707,7 +747,8 @@ section("realm/token binding (P3.2)");
 const KEY = "regression-signing-key-0123456789abcdef";
 const TOKEN_A = "intuit-token-a-000000000000000000000000";
 const TOKEN_B = "intuit-token-b-111111111111111111111111";
-const sign = (over = {}) => signTenantBinding({ realmId: REALM_MULTI, actorUserId: ACTOR_A, chatbotId: CHATBOT, connectorId: CONNECTOR, accessToken: TOKEN_A, issuedAt: Math.floor(Date.now() / 1000), ...over }, over.key ?? KEY);
+let nonceCounter = 0;
+const sign = (over = {}) => signTenantBinding({ realmId: REALM_MULTI, actorUserId: ACTOR_A, chatbotId: CHATBOT, connectorId: CONNECTOR, accessToken: TOKEN_A, issuedAt: Math.floor(Date.now() / 1000), nonce: `regression-nonce-${(nonceCounter += 1)}`, ...over }, over.key ?? KEY);
 const verified = verifyTenantBinding({ binding: sign(), realmId: REALM_MULTI, accessToken: TOKEN_A, key: KEY });
 check("a genuine binding verifies and names the actor", verified.actorUserId === ACTOR_A);
 check("the token never appears inside the binding", !sign().includes(TOKEN_A));
@@ -720,6 +761,19 @@ const tokenMismatch = rejection({ binding: sign(), realmId: REALM_MULTI, accessT
 check("a guessed realm is refused", realmMismatch === BINDING_ERROR_CODES.REALM_MISMATCH);
 check("a swapped token is refused", tokenMismatch === BINDING_ERROR_CODES.TOKEN_MISMATCH);
 check("the two are distinguishable", realmMismatch !== tokenMismatch);
+// A signed header is a bearer credential: without a single-use nonce anything that
+// observed one could resend it unchanged for as long as it still verified.
+check("a binding carries a nonce", typeof verified.nonce === "string" && verified.nonce.length > 0);
+check("a nonce-less binding is refused", rejection({ binding: signTenantBinding({ realmId: REALM_MULTI, actorUserId: ACTOR_A, chatbotId: CHATBOT, connectorId: CONNECTOR, accessToken: TOKEN_A, issuedAt: Math.floor(Date.now() / 1000), nonce: "" }, KEY), realmId: REALM_MULTI, accessToken: TOKEN_A, key: KEY }) === BINDING_ERROR_CODES.MALFORMED);
+check("v1 bindings are refused rather than reinterpreted", rejection({ binding: sign().replace(/^v2\./, "v1."), realmId: REALM_MULTI, accessToken: TOKEN_A, key: KEY }) === BINDING_ERROR_CODES.MALFORMED);
+const spent = new ExecutionReplayStore(BINDING_NONCE_RETENTION_SECONDS * 1_000);
+check("a nonce is spendable once", spent.claim("realm\u0000n1") === true && spent.claim("realm\u0000n1") === false);
+check("and spending one does not spend another", spent.claim("realm\u0000n2") === true);
+check("the spent set is held for the whole window a binding verifies", BINDING_NONCE_RETENTION_SECONDS >= 360);
+check("a spent nonce is forgotten only after that window", (() => {
+  const store = new ExecutionReplayStore(1_000);
+  return store.claim("k", 0) === true && store.claim("k", 500) === false && store.claim("k", 1_500) === true;
+})());
 
 section("managed execution assertion (P7.1)");
 const ASSERTION_KEY = "regression-execution-assertion-key-0123456789abcdef";
