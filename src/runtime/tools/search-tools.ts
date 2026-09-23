@@ -163,8 +163,8 @@ export const SearchVendorsTool = createSearchTool({
   name: "search_vendors",
   label: "vendors",
   description:
-    "Find suppliers in the connected QuickBooks company by name, company or balance. Use this to resolve " +
-    `a vendor id before entering a bill. ${PAGING_NOTE}`,
+    "List or find vendors (suppliers) in the connected QuickBooks company by name, company or balance. " +
+    `Use this to answer questions about vendors, or to resolve a vendor id before entering a bill. ${PAGING_NOTE}`,
   filterFields: [
     "Id",
     "DisplayName",
